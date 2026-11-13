@@ -1,0 +1,181 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+# ============================================================
+# 1. DIRECTORIES
+# ============================================================
+
+input_dir = (
+    "/Users/user/Documents/PhD Polymtl/My PhD/Courses/"
+    "Semester 1/CIV8330E - Climate Change/"
+    "Project_climate/ClimateData/NCEP"
+)
+
+stations_file = os.path.join(input_dir, "Stations.csv")
+
+output_dir = os.path.join(input_dir, "Extracted_Stations")
+os.makedirs(output_dir, exist_ok=True)
+
+# ============================================================
+# 2. READ STATION COORDINATES
+# ============================================================
+
+stations = pd.read_csv(
+    stations_file,
+    encoding="utf-8-sig"
+)
+
+# Expected columns: Site_ID, Lat, Lon
+required = {"Site_ID", "Lat", "Lon"}
+
+if not required.issubset(stations.columns):
+    raise ValueError(
+        f"Missing columns: {required - set(stations.columns)}"
+    )
+
+stations["Lat"] = pd.to_numeric(
+    stations["Lat"], errors="raise"
+)
+stations["Lon"] = pd.to_numeric(
+    stations["Lon"], errors="raise"
+)
+
+# ============================================================
+# 3. IDENTIFY NETCDF FILES
+# ============================================================
+
+files = sorted(glob.glob(
+    os.path.join(input_dir, "prate.sfc.gauss.*.nc")
+))
+
+if not files:
+    raise FileNotFoundError(
+        "No NCEP precipitation NetCDF files found."
+    )
+
+print(f"Found {len(files)} NetCDF files.")
+
+# ============================================================
+# 4. PREPARE STATION OUTPUTS
+# ============================================================
+
+station_data = {}
+
+for _, row in stations.iterrows():
+
+    site_id = str(row["Site_ID"])
+    station_data[site_id] = []
+
+# ============================================================
+# 5. PROCESS EACH ANNUAL FILE
+# ============================================================
+
+for file in files:
+
+    print(f"Processing: {os.path.basename(file)}")
+
+    with xr.open_dataset(file) as ds:
+
+        if "prate" not in ds:
+            raise KeyError(
+                f"'prate' not found in {file}"
+            )
+
+        precip = ds["prate"]
+
+        # Verify units before converting
+        # Read and normalize precipitation units
+        units = precip.attrs.get("units", "").strip().lower()
+
+        print(f"Precipitation units: {units}")
+
+        valid_units = [
+                    "kg/m^2/s",
+                    "kg m-2 s-1",
+                    "kg m**-2 s**-1",
+                    "mm/s"
+                    ]
+
+        if units not in valid_units:
+            raise ValueError(
+                f"Unexpected precipitation units: {units}"
+            )
+
+        for _, row in stations.iterrows():
+
+            site_id = str(row["Site_ID"])
+            latitude = float(row["Lat"])
+            longitude = float(row["Lon"])
+
+            # Match station longitude to dataset convention
+            if float(ds.lon.max()) > 180:
+                longitude = longitude % 360
+            else:
+                longitude = (
+                    (longitude + 180) % 360
+                ) - 180
+
+            # Extract nearest grid cell
+            point = precip.sel(
+                lat=latitude,
+                lon=longitude,
+                method="nearest"
+            )
+
+            # Convert daily mean rate to mm/day
+            daily_precip = point * 86400
+
+            # Convert to DataFrame
+            df_year = (
+                daily_precip
+                .to_dataframe(name="Precip_mm_day")
+                .reset_index()
+            )
+
+            # Keep time and precipitation
+            df_year = df_year[
+                ["time", "Precip_mm_day"]
+            ].copy()
+
+            station_data[site_id].append(df_year)
+
+# ============================================================
+# 6. COMBINE YEARS AND EXPORT
+# ============================================================
+
+for site_id, yearly_data in station_data.items():
+
+    df = pd.concat(
+        yearly_data,
+        ignore_index=True
+    )
+
+    df["time"] = pd.to_datetime(df["time"])
+
+    df = (
+        df.sort_values("time")
+        .drop_duplicates(subset="time")
+        .reset_index(drop=True)
+    )
+
+    df.rename(
+        columns={"time": "Date"},
+        inplace=True
+    )
+
+    output_file = os.path.join(
+        output_dir,
+        f"{site_id}.csv"
+    )
+
+    df.to_csv(output_file, index=False)
+
+    print(
+        f"Saved {site_id}: "
+        f"{len(df)} daily records"
+    )
+
+print("All station extractions completed.")
